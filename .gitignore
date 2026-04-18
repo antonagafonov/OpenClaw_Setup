@@ -1,0 +1,16 @@
+# OpenClaw runtime state
+.openclaw/
+state/
+memory/
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
