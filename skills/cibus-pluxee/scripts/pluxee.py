@@ -114,47 +114,63 @@ def _clean_state(session_state):
     return clean
 
 
+def _build_session():
+    """Build a requests.Session with cookies from saved state.
+
+    Bypasses the browser for API calls — the Angular app deletes our auth
+    cookie on navigation, so we skip it entirely and hit the API directly.
+    """
+    state = _clean_state(require_session())
+    sess = requests.Session()
+    for c in state.get("cookies", []):
+        sess.cookies.set(
+            c["name"], c["value"],
+            domain=c.get("domain"),
+            path=c.get("path", "/"),
+        )
+    sess.headers.update({
+        "application-id": APP_ID,
+        "Origin": SITE_URL,
+        "Referer": SITE_URL + "/user/orders",
+    })
+    return sess
+
+
 async def _open_browser(session_state):
-    """Open Firefox with session, navigate to base page. Returns (playwright, browser, page)."""
-    p = await async_playwright().start()
-    browser = await p.firefox.launch(headless=True)
-    context = await browser.new_context(storage_state=_clean_state(session_state))
-    page = await context.new_page()
-    await page.goto(SITE_URL + "/user/orders", wait_until="domcontentloaded", timeout=30000)
-    await page.wait_for_timeout(3000)
-    return p, browser, page
+    """Back-compat shim — returns a fake page object that proxies fetches
+    through requests.Session. Most command functions call:
+        p, browser, page = await _open_browser(require_session())
+        ... use page ...
+        finally: await browser.close(); await p.stop()
+
+    We satisfy that shape with no-op playwright/browser and a page with
+    _post/_get compatible .evaluate-returning wrappers handled via
+    `_post(page, ...)` / `_get(page, ...)` below.
+    """
+    class _FakeBrowser:
+        async def close(self): pass
+    class _FakePlaywright:
+        async def stop(self): pass
+    class _FakePage:
+        _session = _build_session()
+    return _FakePlaywright(), _FakeBrowser(), _FakePage()
 
 
 async def _post(page, body):
-    """POST to main.py API."""
-    body_json = json.dumps(body, ensure_ascii=False)
-    return await page.evaluate(f"""
-        async () => {{
-            const resp = await fetch('{API_DOMAIN}/main.py', {{
-                method: 'POST', credentials: 'include',
-                headers: {{
-                    'Content-Type': 'application/json; charset=utf-8',
-                    'application-id': '{APP_ID}'
-                }},
-                body: {repr(body_json)}
-            }});
-            return await resp.json();
-        }}
-    """)
+    """POST to main.py API using requests session."""
+    r = page._session.post(
+        f"{API_DOMAIN}/main.py",
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        timeout=30
+    )
+    return r.json()
 
 
 async def _get(page, path_and_query):
-    """GET from consumers API."""
-    url = f"{API_DOMAIN}/{path_and_query}"
-    return await page.evaluate(f"""
-        async () => {{
-            const resp = await fetch('{url}', {{
-                credentials: 'include',
-                headers: {{'application-id': '{APP_ID}'}}
-            }});
-            return await resp.json();
-        }}
-    """)
+    """GET from consumers API using requests session."""
+    r = page._session.get(f"{API_DOMAIN}/{path_and_query}", timeout=30)
+    return r.json()
 
 
 # ─── Auth commands ────────────────────────────────────────────────────────────
@@ -262,11 +278,29 @@ async def cmd_verify(otp: str):
         await page.goto(SITE_URL + "/login", wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(4000)
 
+        # Wait for grecaptcha v3 to fully load (enterprise version uses grecaptcha.ready)
+        try:
+            await page.wait_for_function(
+                """() => {
+                    if (typeof grecaptcha === 'undefined') return false;
+                    if (typeof grecaptcha.execute !== 'function') return false;
+                    if (typeof grecaptcha.ready !== 'function') return false;
+                    return true;
+                }""",
+                timeout=20000
+            )
+        except Exception:
+            print("[pluxee] reCAPTCHA did not load in time.", file=sys.stderr)
+            await browser.close()
+            sys.exit(1)
+
         try:
             captcha_token = await page.evaluate(f"""
                 () => new Promise((resolve, reject) => {{
-                    grecaptcha.execute('{RECAPTCHA_SITE_KEY}', {{action: 'loginOtp'}})
-                        .then(resolve).catch(reject);
+                    grecaptcha.ready(() => {{
+                        grecaptcha.execute('{RECAPTCHA_SITE_KEY}', {{action: 'loginOtp'}})
+                            .then(resolve).catch(reject);
+                    }});
                 }})
             """)
         except Exception as e:
@@ -302,6 +336,11 @@ async def cmd_verify(otp: str):
             sys.exit(1)
 
         token_data = result.get("data", {})
+
+        # Navigate to consumers.pluxee.co.il to trigger session cookie exchange
+        await page.goto(SITE_URL + "/user/orders", wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(4000)
+
         full_state = await context.storage_state()
         save_json(FULL_SESSION_FILE, full_state)
         await browser.close()
@@ -584,6 +623,182 @@ async def cmd_menu(restaurant_id: int, order_type: int = 1):
     print()
 
 
+# ─── Cart & ordering ─────────────────────────────────────────────────────────
+
+async def _get_menu_item(page, restaurant_id, item_id, order_type=1):
+    """Find an item in the menu tree and return (category_id, item_dict)."""
+    userinfo = await _get(page, "prx_user_info.py?version=1&rand_onboarding=0")
+    comp_id = userinfo.get("comp_id") or userinfo.get("company_id", 0)
+    addr_id = userinfo.get("default_addr_id", -1)
+    tree = await _get(page, f"rest_menu_tree.py?restaurant_id={restaurant_id}&comp_id={comp_id}"
+                      f"&order_type={order_type}&element_type_deep=15&lang=he&address_id={addr_id}")
+
+    def search(node, cat_id=None):
+        if not isinstance(node, dict):
+            return None
+        for key, val in node.items():
+            if not key.isdigit() or not isinstance(val, list):
+                continue
+            etype = int(key)
+            for item in val:
+                if etype == 11:
+                    r = search(item, item.get("element_id"))
+                    if r:
+                        return r
+                elif etype == 12:
+                    r = search(item, cat_id)
+                    if r:
+                        return r
+                elif etype == 13 and item.get("element_id") == item_id:
+                    return cat_id, item
+        return None
+
+    return search(tree)
+
+
+async def cmd_add(restaurant_id: int, item_id: int, quantity: int = 1, order_type: int = 1):
+    """Add an item to the cart."""
+    p, browser, page = await _open_browser(require_session())
+    try:
+        result = _get_menu_item(page, restaurant_id, item_id, order_type)
+        if asyncio.iscoroutine(result):
+            result = await result
+        if not result:
+            print(f"[pluxee] Item {item_id} not found in restaurant {restaurant_id}.", file=sys.stderr)
+            sys.exit(1)
+
+        cat_id, item = result
+        dish = {
+            "category_id": cat_id,
+            "dish_id": item["element_id"],
+            "co_owner_id": -1,
+            "dish_price": item["price"],
+            "extra_list": []
+        }
+
+        for _ in range(quantity):
+            r = await _post(page, {"type": "prx_add_prod_to_cart", "order_type": order_type, "dish_list": [dish]})
+            if r.get("code") != 0:
+                print(f"[pluxee] Failed to add: {r.get('msg')}", file=sys.stderr)
+                sys.exit(1)
+
+        print(f"[pluxee] Added {quantity}x {item['name']} (₪{item['price']}) to cart.")
+
+        cart = await _post(page, {"type": "prx_get_cart"})
+        _print_cart(cart)
+    finally:
+        await browser.close()
+        await p.stop()
+
+
+async def cmd_cart():
+    """Show current cart."""
+    p, browser, page = await _open_browser(require_session())
+    try:
+        cart = await _post(page, {"type": "prx_get_cart"})
+        _print_cart(cart)
+    finally:
+        await browser.close()
+        await p.stop()
+
+
+async def cmd_clear_cart():
+    """Clear all items from the cart."""
+    p, browser, page = await _open_browser(require_session())
+    try:
+        await _post(page, {"type": "prx_del_cart"})
+        print("[pluxee] Cart cleared.")
+    finally:
+        await browser.close()
+        await p.stop()
+
+
+async def cmd_simulate():
+    """Preview order without placing it."""
+    from datetime import datetime
+    p, browser, page = await _open_browser(require_session())
+    try:
+        cart = await _post(page, {"type": "prx_get_cart"})
+        dishes = cart.get("dish_list", [])
+        if not dishes:
+            print("[pluxee] Cart is empty. Add items first.")
+            return
+
+        _print_cart(cart)
+        now = datetime.now().strftime("%H:%M")
+        sim = await _post(page, {"type": "prx_simulate_order", "order_time": now})
+        if sim.get("code") == 0:
+            print(f"\n✅ Order simulation OK — ready to submit.")
+            print(f"   To confirm: pluxee.py order --confirm")
+        else:
+            print(f"\n❌ Simulation failed: {sim.get('msg')}")
+            print(json.dumps(sim, ensure_ascii=False, indent=2))
+    finally:
+        await browser.close()
+        await p.stop()
+
+
+async def cmd_order(confirm: bool = False):
+    """Place the order. Requires --confirm flag."""
+    from datetime import datetime
+    if not confirm:
+        print("[pluxee] Dry run (no --confirm). Showing cart and simulating...")
+        await cmd_simulate()
+        return
+
+    p, browser, page = await _open_browser(require_session())
+    try:
+        cart = await _post(page, {"type": "prx_get_cart"})
+        dishes = cart.get("dish_list", [])
+        if not dishes:
+            print("[pluxee] Cart is empty.", file=sys.stderr)
+            sys.exit(1)
+
+        _print_cart(cart)
+        now = datetime.now().strftime("%H:%M")
+
+        # Simulate first
+        sim = await _post(page, {"type": "prx_simulate_order", "order_time": now})
+        if sim.get("code") != 0:
+            print(f"[pluxee] Simulation failed: {sim.get('msg')}", file=sys.stderr)
+            sys.exit(1)
+
+        # Apply order (REAL — charges money)
+        result = await _post(page, {"type": "prx_apply_order", "order_time": now})
+        if result.get("code") == 0:
+            print(f"\n✅ Order placed! Total: ₪{cart.get('total_price', '?')}")
+        else:
+            print(f"\n❌ Order failed: {result.get('msg')}")
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+    finally:
+        await browser.close()
+        await p.stop()
+
+
+def _print_cart(cart):
+    """Pretty-print cart contents."""
+    dishes = cart.get("dish_list", [])
+    total = cart.get("total_price", 0)
+    discount = cart.get("total_discount", 0)
+
+    if not dishes:
+        print("[pluxee] Cart is empty.")
+        return
+
+    print(f"\n🛒 Cart ({len(dishes)} items):")
+    for d in dishes:
+        name = d.get("dish_name", d.get("name", "?"))
+        price = d.get("dish_price", d.get("price", 0))
+        amount = d.get("amount", 1)
+        extras = d.get("extra_list", [])
+        extra_str = f" + {len(extras)} extras" if extras else ""
+        print(f"  • {name} x{amount}  ₪{price}{extra_str}")
+    print(f"  {'─'*30}")
+    if discount:
+        print(f"  Discount: -₪{discount}")
+    print(f"  Total: ₪{total}")
+
+
 # ─── Morning ping ────────────────────────────────────────────────────────────
 
 # Load from config (see ~/.pluxee/config.json)
@@ -781,6 +996,37 @@ async def main():
             else:
                 i += 1
         await cmd_menu(restaurant_id, order_type)
+
+    elif cmd == "add":
+        if len(args) < 3:
+            print("Usage: pluxee.py add <restaurant_id> <item_id> [--qty N] [--type pickup|delivery]", file=sys.stderr)
+            sys.exit(1)
+        restaurant_id = int(args[1])
+        item_id = int(args[2])
+        quantity = 1
+        order_type = 1
+        i = 3
+        while i < len(args):
+            if args[i] in ("--qty", "-q") and i + 1 < len(args):
+                quantity = int(args[i + 1]); i += 2
+            elif args[i] in ("--type", "-t") and i + 1 < len(args):
+                order_type = 2 if args[i + 1].startswith("d") else 1; i += 2
+            else:
+                i += 1
+        await cmd_add(restaurant_id, item_id, quantity, order_type)
+
+    elif cmd == "cart":
+        await cmd_cart()
+
+    elif cmd == "clear_cart":
+        await cmd_clear_cart()
+
+    elif cmd == "simulate":
+        await cmd_simulate()
+
+    elif cmd == "order":
+        confirm = "--confirm" in args
+        await cmd_order(confirm)
 
     elif cmd == "morning_ping":
         order_type = 1
