@@ -86,6 +86,11 @@ SESSION_FILE = STATE_DIR / "session.json"
 TOKEN_FILE = STATE_DIR / "token.json"
 BROWSER_STATE_FILE = STATE_DIR / "browser_state.json"
 FULL_SESSION_FILE = STATE_DIR / "full_session.json"
+# Plain JWT token from a real browser login (see `set_token` command).
+# Programmatic logins via Playwright get tokens without user claims that
+# the server rejects — a manually-copied token works because it was issued
+# in response to a real-user reCAPTCHA score.
+BEARER_TOKEN_FILE = STATE_DIR / "bearer_token.txt"
 
 
 def load_json(path):
@@ -114,62 +119,57 @@ def _clean_state(session_state):
     return clean
 
 
-def _build_session():
-    """Build a requests.Session with cookies from saved state.
+def _read_bearer_token():
+    """Load the browser-obtained JWT from bearer_token.txt.
 
-    Bypasses the browser for API calls — the Angular app deletes our auth
-    cookie on navigation, so we skip it entirely and hit the API directly.
+    Programmatic Playwright logins get tokens without user claims that
+    the server rejects. A manually-copied token from a real browser login
+    has `user_id` and works. See `set_token` command.
     """
-    state = _clean_state(require_session())
-    sess = requests.Session()
-    for c in state.get("cookies", []):
-        sess.cookies.set(
-            c["name"], c["value"],
-            domain=c.get("domain"),
-            path=c.get("path", "/"),
-        )
-    sess.headers.update({
+    if not BEARER_TOKEN_FILE.exists():
+        print("[pluxee] No token. Run: pluxee.py set_token <jwt_from_browser>", file=sys.stderr)
+        print("  (login via https://consumers.pluxee.co.il, copy the `token` cookie)", file=sys.stderr)
+        sys.exit(1)
+    return BEARER_TOKEN_FILE.read_text().strip()
+
+
+def _api_headers():
+    return {
+        "accept": "application/json, text/plain, */*",
+        "content-type": "application/json; charset=utf-8",
         "application-id": APP_ID,
-        "Origin": SITE_URL,
-        "Referer": SITE_URL + "/user/orders",
-    })
-    return sess
+        "origin": SITE_URL,
+        "referer": SITE_URL + "/",
+        "cookie": f"token={_read_bearer_token()}",
+    }
 
 
-async def _open_browser(session_state):
-    """Back-compat shim — returns a fake page object that proxies fetches
-    through requests.Session. Most command functions call:
-        p, browser, page = await _open_browser(require_session())
-        ... use page ...
-        finally: await browser.close(); await p.stop()
-
-    We satisfy that shape with no-op playwright/browser and a page with
-    _post/_get compatible .evaluate-returning wrappers handled via
-    `_post(page, ...)` / `_get(page, ...)` below.
-    """
+async def _open_browser(session_state=None):
+    """Back-compat shim: returns fake page that proxies through requests."""
     class _FakeBrowser:
         async def close(self): pass
     class _FakePlaywright:
         async def stop(self): pass
-    class _FakePage:
-        _session = _build_session()
+    class _FakePage: pass
     return _FakePlaywright(), _FakeBrowser(), _FakePage()
 
 
 async def _post(page, body):
-    """POST to main.py API using requests session."""
-    r = page._session.post(
+    """POST to main.py API using the bearer token."""
+    r = requests.post(
         f"{API_DOMAIN}/main.py",
-        headers={"Content-Type": "application/json; charset=utf-8"},
+        headers=_api_headers(),
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        timeout=30
+        timeout=30,
     )
     return r.json()
 
 
 async def _get(page, path_and_query):
-    """GET from consumers API using requests session."""
-    r = page._session.get(f"{API_DOMAIN}/{path_and_query}", timeout=30)
+    """GET from consumers API using the bearer token."""
+    headers = _api_headers()
+    headers.pop("content-type", None)
+    r = requests.get(f"{API_DOMAIN}/{path_and_query}", headers=headers, timeout=30)
     return r.json()
 
 
@@ -182,7 +182,19 @@ async def cmd_send(phone: str):
 
     async with async_playwright() as p:
         browser = await p.firefox.launch(headless=True)
-        context = await browser.new_context()
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+            viewport={"width": 1440, "height": 900},
+            locale="he-IL",
+            timezone_id="Asia/Jerusalem"
+        )
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => false});
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [{name: 'PDF Viewer'}, {name: 'Chrome PDF Viewer'}]
+            });
+            Object.defineProperty(navigator, 'languages', {get: () => ['he-IL', 'he', 'en-US', 'en']});
+        """)
         page = await context.new_page()
 
         async def capture_sendotp(response):
@@ -196,7 +208,13 @@ async def cmd_send(phone: str):
         page.on("response", capture_sendotp)
 
         await page.goto(SITE_URL + "/login", wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(4000)
+
+        # Human-like behavior for reCAPTCHA v3 scoring
+        await page.wait_for_timeout(2000)
+        await page.mouse.move(200, 200)
+        await page.wait_for_timeout(900)
+        await page.mouse.move(550, 400)
+        await page.wait_for_timeout(1500)
 
         for el in await page.query_selector_all("div"):
             if (await el.text_content()).strip() == "קוד חד פעמי" and await el.is_visible():
@@ -251,6 +269,107 @@ async def cmd_send(phone: str):
     print(f"[pluxee] Then run: python3 pluxee.py verify <code>")
 
 
+async def cmd_login_password(phone: str, password: str):
+    """Login with phone + password via the web login form (no OTP)."""
+    print(f"[pluxee] Logging in {phone} with password...")
+
+    async with async_playwright() as p:
+        browser = await p.firefox.launch(headless=True)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+            viewport={"width": 1440, "height": 900},
+            locale="he-IL",
+            timezone_id="Asia/Jerusalem"
+        )
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => false});
+            Object.defineProperty(navigator, 'plugins', {get: () => [{name: 'PDF Viewer'}, {name: 'Chrome PDF Viewer'}]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['he-IL', 'he', 'en-US', 'en']});
+        """)
+        page = await context.new_page()
+
+        await page.goto(SITE_URL + "/login", wait_until="domcontentloaded", timeout=30000)
+
+        # Human-like warmup
+        await page.wait_for_timeout(2000)
+        await page.mouse.move(200, 200)
+        await page.wait_for_timeout(1000)
+        await page.mouse.move(550, 400)
+        await page.wait_for_timeout(2000)
+
+        # Wait for grecaptcha
+        await page.wait_for_function(
+            "() => typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function' && typeof grecaptcha.ready === 'function'",
+            timeout=20000
+        )
+        captcha_token = await page.evaluate(f"""
+            () => new Promise((r, j) => grecaptcha.ready(() =>
+                grecaptcha.execute('{RECAPTCHA_SITE_KEY}', {{action: 'login'}}).then(r).catch(j)))
+        """)
+
+        # Call authToken with username+password (no otpPin)
+        result = await page.evaluate(f"""
+            async () => {{
+                const resp = await fetch('{CAPIR_BASE_URL}/auth/authToken', {{
+                    method: 'POST', credentials: 'include',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{
+                        username: '{phone}',
+                        password: '{password}',
+                        company: '',
+                        reCAPTCHAToken: '{captcha_token}',
+                        trustDevice: false
+                    }})
+                }});
+                return {{status: resp.status, json: await resp.json()}};
+            }}
+        """)
+
+        status = result.get("status", 0)
+        body = result.get("json", {})
+        print(f"[pluxee] authToken status: {status}")
+        print(f"[pluxee] response: {json.dumps(body, ensure_ascii=False)[:400]}")
+
+        if status == 210:
+            # Server wants OTP; maskedInput tells us which method
+            data = body.get("data", {})
+            print(f"[pluxee] Server requires OTP. Method: {data.get('method')}, masked: {data.get('maskedInput')}")
+            save_json(SESSION_FILE, {"phone": phone, "sent_at": time.time(), "via": "password"})
+            state = await context.storage_state()
+            save_json(BROWSER_STATE_FILE, state)
+            await browser.close()
+            print("[pluxee] Browser state saved. Now run: pluxee.py verify <6-digit-code>")
+            return
+
+        if status >= 400:
+            err = body.get("error", {}).get("message", "Unknown")
+            print(f"[pluxee] Login failed: {err}", file=sys.stderr)
+            await browser.close()
+            sys.exit(1)
+
+        # 201 — direct success (no OTP)
+        token_data = body.get("data", {})
+        # Warmup
+        warmup = await page.evaluate(f"""
+            async () => {{
+                const r = await fetch('{API_DOMAIN}/main.py', {{
+                    method: 'POST', credentials: 'include',
+                    headers: {{'Content-Type': 'application/json', 'application-id': '{APP_ID}'}},
+                    body: JSON.stringify({{type: 'prx_get_budgets'}})
+                }});
+                return await r.json();
+            }}
+        """)
+        print(f"[pluxee] warmup: {json.dumps(warmup, ensure_ascii=False)[:200]}")
+
+        full_state = await context.storage_state()
+        save_json(FULL_SESSION_FILE, full_state)
+        save_json(TOKEN_FILE, token_data)
+        await browser.close()
+
+    print(f"[pluxee] Password login OK.")
+
+
 async def cmd_verify(otp: str):
     """Restore browser state, get reCAPTCHA token, call authToken."""
     session = load_json(SESSION_FILE)
@@ -272,13 +391,36 @@ async def cmd_verify(otp: str):
 
     async with async_playwright() as p:
         browser = await p.firefox.launch(headless=True)
-        context = await browser.new_context(storage_state=browser_state)
+        context = await browser.new_context(
+            storage_state=browser_state,
+            user_agent="Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+            viewport={"width": 1440, "height": 900},
+            locale="he-IL",
+            timezone_id="Asia/Jerusalem"
+        )
+
+        # Hide automation fingerprints that reCAPTCHA v3 scores on
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => false});
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [{name: 'PDF Viewer'}, {name: 'Chrome PDF Viewer'}, {name: 'Chromium PDF Viewer'}]
+            });
+            Object.defineProperty(navigator, 'languages', {get: () => ['he-IL', 'he', 'en-US', 'en']});
+        """)
+
         page = await context.new_page()
-
         await page.goto(SITE_URL + "/login", wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(4000)
 
-        # Wait for grecaptcha v3 to fully load (enterprise version uses grecaptcha.ready)
+        # Human-like idle + mouse movement — boosts reCAPTCHA v3 score
+        await page.wait_for_timeout(2000)
+        await page.mouse.move(120, 150)
+        await page.wait_for_timeout(800)
+        await page.mouse.move(600, 400)
+        await page.wait_for_timeout(1200)
+        await page.mouse.move(500, 500)
+        await page.wait_for_timeout(2500)
+
+        # Wait for grecaptcha v3 to fully load
         try:
             await page.wait_for_function(
                 """() => {
@@ -337,9 +479,24 @@ async def cmd_verify(otp: str):
 
         token_data = result.get("data", {})
 
-        # Navigate to consumers.pluxee.co.il to trigger session cookie exchange
-        await page.goto(SITE_URL + "/user/orders", wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(4000)
+        # Warm up session: call a simple API while still in the verify browser.
+        # This forces the server to register our session cookies, and Playwright
+        # captures any additional cookies set by the response.
+        warmup = await page.evaluate(f"""
+            async () => {{
+                const r = await fetch('{API_DOMAIN}/main.py', {{
+                    method: 'POST', credentials: 'include',
+                    headers: {{
+                        'Content-Type': 'application/json; charset=utf-8',
+                        'application-id': '{APP_ID}'
+                    }},
+                    body: JSON.stringify({{type: 'prx_get_budgets'}})
+                }});
+                return await r.json();
+            }}
+        """)
+        if warmup.get("code") != 0:
+            print(f"[pluxee] Warning: warmup API call failed: {warmup.get('msg')}", file=sys.stderr)
 
         full_state = await context.storage_state()
         save_json(FULL_SESSION_FILE, full_state)
@@ -950,6 +1107,44 @@ async def main():
             print("Usage: pluxee.py verify <otp>", file=sys.stderr)
             sys.exit(1)
         await cmd_verify(args[1].strip())
+
+    elif cmd == "login_password":
+        phone = DEFAULT_PHONE
+        password = ""
+        i = 1
+        while i < len(args):
+            if args[i] in ("--phone", "-p") and i + 1 < len(args):
+                phone = args[i + 1]; i += 2
+            elif args[i] in ("--password", "-P") and i + 1 < len(args):
+                password = args[i + 1]; i += 2
+            else:
+                i += 1
+        if not phone or not password:
+            print("Usage: pluxee.py login_password --phone X --password Y", file=sys.stderr)
+            sys.exit(1)
+        await cmd_login_password(phone, password)
+
+    elif cmd == "set_token":
+        if len(args) < 2:
+            print("Usage: pluxee.py set_token <jwt>", file=sys.stderr)
+            print("  Login via https://consumers.pluxee.co.il in a browser,", file=sys.stderr)
+            print("  copy the `token` cookie value, paste it here.", file=sys.stderr)
+            sys.exit(1)
+        token = args[1].strip()
+        BEARER_TOKEN_FILE.write_text(token)
+        BEARER_TOKEN_FILE.chmod(0o600)
+        print(f"[pluxee] Token saved to {BEARER_TOKEN_FILE}")
+        # Verify it works
+        r = requests.post(f"{API_DOMAIN}/main.py",
+            headers=_api_headers(),
+            json={"type": "prx_get_budgets"}, timeout=30)
+        data = r.json()
+        if data.get("code") == 0:
+            for b in data.get("data", []):
+                print(f"[pluxee] OK — Balance: ₪{b.get('CurrBudget')} / ₪{b.get('CreatioBudget')} (expires {b.get('ExpirationDate')})")
+        else:
+            print(f"[pluxee] Token rejected: {data.get('msg')}", file=sys.stderr)
+            sys.exit(1)
 
     elif cmd == "status":
         cmd_status()
